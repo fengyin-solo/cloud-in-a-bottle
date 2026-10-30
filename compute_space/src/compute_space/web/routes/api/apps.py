@@ -19,6 +19,7 @@ from litestar import Router
 from litestar import WebSocket
 from litestar import get
 from litestar import post
+from litestar import put
 from litestar import websocket
 from litestar.di import NamedDependency
 from litestar.exceptions import InternalServerException
@@ -35,6 +36,13 @@ from litestar.response import Redirect
 from compute_space.config import Config
 from compute_space.core import archive_backend
 from compute_space.core.app_id import is_valid_app_id
+from compute_space.core.app_tags import TagValidationError
+from compute_space.core.app_tags import find_app_ids_by_tags
+from compute_space.core.app_tags import get_tags
+from compute_space.core.app_tags import get_tags_map
+from compute_space.core.app_tags import normalize_tag_filter
+from compute_space.core.app_tags import normalize_tags
+from compute_space.core.app_tags import replace_tags
 from compute_space.core.apps import RESERVED_PATHS
 from compute_space.core.apps import app_container_log_path
 from compute_space.core.apps import app_log_path
@@ -160,6 +168,21 @@ class AppSummary:
     name: str
     status: str
     error_message: str | None
+    # Added after the original four fields; older clients ignore it.
+    tags: list[str] = attr.Factory(list)
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class AppTagsRequest:
+    """Whole-set replacement payload for PUT /api/app_tags/{app_id}."""
+
+    tags: list[str] = attr.Factory(list)
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class AppTagsResponse:
+    app_id: str
+    tags: list[str]
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -461,17 +484,81 @@ async def api_add_app(
 
 
 @get("/api/apps", guards=[require_owner_auth])
-async def api_apps(db: NamedDependency[sqlite3.Connection]) -> list[AppSummary]:
-    rows = db.execute("SELECT app_id, name, status, error_message FROM apps ORDER BY name").fetchall()
+async def api_apps(request: Request[Any, Any, Any], db: NamedDependency[sqlite3.Connection]) -> list[AppSummary]:
+    # Repeated ?tag= params AND-filter the list (an app must carry every
+    # requested tag). Filter values are normalized leniently; an unknown or
+    # malformed tag simply matches nothing -> empty 200 list, never a 5xx.
+    raw_tag_filters = request.query_params.getall("tag") if "tag" in request.query_params else None
+    tag_filters = normalize_tag_filter(raw_tag_filters)
+    if tag_filters:
+        matching_ids = find_app_ids_by_tags(tag_filters, db)
+        if not matching_ids:
+            return []
+        placeholders = ", ".join("?" for _ in matching_ids)
+        # ORDER BY name keeps the filtered response in the same stable order
+        # as the unfiltered list, regardless of the filter tags' order.
+        rows = db.execute(
+            f"SELECT app_id, name, status, error_message FROM apps WHERE app_id IN ({placeholders}) ORDER BY name",
+            tuple(matching_ids),
+        ).fetchall()
+    else:
+        rows = db.execute("SELECT app_id, name, status, error_message FROM apps ORDER BY name").fetchall()
+    tags_map = get_tags_map((row["app_id"] for row in rows), db)
     return [
         AppSummary(
             app_id=row["app_id"],
             name=row["name"],
             status=row["status"],
             error_message=row["error_message"],
+            tags=tags_map.get(row["app_id"], []),
         )
         for row in rows
     ]
+
+
+@get(
+    "/api/app_tags/{app_id:str}",
+    guards=[require_owner_auth],
+    raises=[ValidationException, NotFoundException],
+)
+async def get_app_tags(app_id: FromPath[str], db: NamedDependency[sqlite3.Connection]) -> Response[AppTagsResponse]:
+    """Read one app's normalized tag set."""
+    _resolve_app(app_id, db)
+    return Response(
+        content=AppTagsResponse(app_id=app_id, tags=get_tags(app_id, db)),
+        status_code=200,
+        media_type=MediaType.JSON,
+    )
+
+
+@put(
+    "/api/app_tags/{app_id:str}",
+    guards=[require_owner_auth],
+    raises=[ValidationException, NotFoundException],
+)
+async def replace_app_tags(
+    app_id: FromPath[str],
+    data: AppTagsRequest,
+    db: NamedDependency[sqlite3.Connection],
+) -> Response[AppTagsResponse]:
+    """Replace one app's whole tag set with the normalized payload.
+
+    Only ``app_tags`` rows are deleted/inserted: the apps row — app_id,
+    status, ports, container_id and every manifest-derived column — is not
+    touched, so editing tags can't perturb the running app.
+    """
+    _resolve_app(app_id, db)
+    try:
+        tags = normalize_tags(data.tags)
+    except TagValidationError as exc:
+        raise ValidationException(detail=str(exc)) from exc
+    replace_tags(app_id, tags, db)
+    db.commit()
+    return Response(
+        content=AppTagsResponse(app_id=app_id, tags=tags),
+        status_code=200,
+        media_type=MediaType.JSON,
+    )
 
 
 async def _read_app_git_info(repo_path: str | None) -> tuple[str | None, str | None, bool | None]:
@@ -1263,6 +1350,8 @@ api_apps_routes = Router(
         check_port,
         api_add_app,
         api_apps,
+        get_app_tags,
+        replace_app_tags,
         app_status,
         app_diagnostics,
         app_logs,

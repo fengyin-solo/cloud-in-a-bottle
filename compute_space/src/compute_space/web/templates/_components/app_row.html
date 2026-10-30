@@ -1,8 +1,10 @@
 {#- One row of the dashboard app list. ``data-status`` drives both the dot
-    colour (CSS) and the polling loop's status updates (dashboard.js). -#}
-{% macro app_row(app) -%}
+    colour (CSS) and the polling loop's status updates (dashboard.js).
+    ``data-tags`` is the JSON tag list read by the dashboard's tag filter. -#}
+{% from "_components/tag.html" import tag_chips %}
+{% macro app_row(app, tags=None) -%}
 <div class="app-row" data-app-id="{{ app.app_id }}" data-status="{{ app.status }}"
-     data-app-name="{{ app.name }}">
+     data-app-name="{{ app.name }}" data-tags='{{ (tags or []) | tojson }}'>
   <div class="app-row__main">
     <a class="app-row__name" href="{{ app_url(app.name) }}" target="_blank" rel="noopener">{{ app.name }}</a>
     {%- if app.manifest_name and app.manifest_name != app.name %}
@@ -12,5 +14,8 @@
     <span class="visually-hidden app-row__status">{{ app.status }}</span>
   </div>
   <a class="app-row__details" href="/app_detail/{{ app.name }}">Details</a>
+  {#- Full-width wrapped line so tags never squeeze the name or Details link,
+      including on narrow screens. Renders nothing when the app has no tags. -#}
+  {{ tag_chips(tags, class_="tag-chips--row") }}
 </div>
 {%- endmacro %}

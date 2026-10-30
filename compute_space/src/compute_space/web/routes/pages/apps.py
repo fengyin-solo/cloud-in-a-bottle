@@ -16,6 +16,11 @@ from litestar.response import Template
 
 from compute_space.config import Config
 from compute_space.core.app_id import is_valid_app_name
+from compute_space.core.app_tags import MAX_TAGS_PER_APP
+from compute_space.core.app_tags import MAX_TAG_LENGTH
+from compute_space.core.app_tags import all_tags as all_app_tags
+from compute_space.core.app_tags import get_tags
+from compute_space.core.app_tags import get_tags_map
 from compute_space.core.apps import deserialize_links
 from compute_space.core.auth.permissions_v2 import get_all_permissions_v2
 from compute_space.core.domains import Domain
@@ -43,11 +48,15 @@ CATALOG_REPO_URL = "https://github.com/cloud-in-a-bottle/app-catalog"
 @get(["/", "/dashboard"], guards=[require_owner_auth])
 async def dashboard(db: NamedDependency[sqlite3.Connection]) -> Template:
     apps_list = db.execute("SELECT * FROM apps ORDER BY name").fetchall()
+    tags_by_app = get_tags_map((row["app_id"] for row in apps_list), db)
+    tag_vocabulary = all_app_tags(db)
     catalog_installed = db.execute("SELECT 1 FROM apps WHERE name = ?", (CATALOG_APP_NAME,)).fetchone() is not None
     return Template(
         template_name="dashboard.html",
         context={
             "apps": apps_list,
+            "tags_by_app": tags_by_app,
+            "tag_vocabulary": tag_vocabulary,
             "catalog_installed": catalog_installed,
             "catalog_app_name": CATALOG_APP_NAME,
         },
@@ -87,6 +96,10 @@ async def app_detail(
     # User-facing links the app advertised in its manifest's [[links]].
     links = deserialize_links(app_row["links"])
 
+    # Owner-assigned tags (productivity, media, ...), normalized at write
+    # time by /api/app_tags.
+    tags = get_tags(app_id, db)
+
     # Permissions: granted + manifest-declared but not yet granted. The
     # ungranted diff uses the same shared helper the update/reload gate uses,
     # so the "needs approval" set the owner sees here matches what an update
@@ -123,6 +136,7 @@ async def app_detail(
             "app": app_row,
             "public_paths": json.loads(app_row["public_paths"] or "[]"),
             "links": links,
+            "tags": tags,
             "databases": databases,
             "port_mappings": port_mappings,
             "services_provided": services_provided,
@@ -130,6 +144,8 @@ async def app_detail(
             "granted_permissions": granted_perms,
             "ungranted_permissions": ungranted_perms,
             "edit_app": edit_app,
+            "max_tags_per_app": MAX_TAGS_PER_APP,
+            "max_tag_length": MAX_TAG_LENGTH,
         },
     )
 

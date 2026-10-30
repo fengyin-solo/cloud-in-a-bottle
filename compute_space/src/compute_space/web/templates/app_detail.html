@@ -3,6 +3,7 @@
 {% from "_components/icon.html" import icon %}
 {% from "_components/info_table.html" import info_table, info_row %}
 {% from "_components/section.html" import section_head %}
+{% from "_components/tag.html" import tag_chips %}
 
 {% macro edit_button(label, onclick) -%}
 <button class="icon-btn" type="button" title="{{ label }}" aria-label="{{ label }}"
@@ -37,6 +38,26 @@
   <p class="hint">Append <code>@branch</code> (or a tag/commit) to change the ref. Saving
     re-points the upstream and pulls the latest code.</p>
   <span id="remote-error" class="field-error"></span>
+</span>
+{%- endmacro %}
+
+{#- Tags, like name/remote, edit in place: the display span carries the
+    chips (re-rendered by app-detail.js after a save) and the edit span a
+    comma-separated text input. -#}
+{% macro tags_value() -%}
+<span class="info-value" id="tags-display">
+  <span id="tags-chips">{{ tag_chips(tags, class_="tag-chips--detail") }}{% if not tags %}<span class="muted" id="tags-empty-label">No tags.</span>{% endif %}</span>
+  {{ edit_button("Edit tags", "editTags()") }}
+</span>
+<span class="info-value" id="tags-edit" hidden>
+  <input type="text" id="tags-input" style="max-width:20em;"
+         placeholder="productivity, media, internal, personal"
+         aria-label="Tags, comma-separated">
+  {{ button("Save", variant="primary", onclick="saveTags()") }}
+  {{ button("Cancel", onclick="cancelTags()") }}
+  <p class="hint">Comma-separated. Up to {{ max_tags_per_app }} tags; each up to
+    {{ max_tag_length }} characters. Lowercase letters, numbers, hyphens and underscores.</p>
+  <span id="tags-error" class="field-error"></span>
 </span>
 {%- endmacro %}
 
@@ -89,6 +110,7 @@ None. All paths require Cloud in a Bottle login.
     </tr>
     {{ info_row("Version", app.version) }}
     {{ info_row("Description", app.description or "---") }}
+    {{ info_row("Tags", tags_value()) }}
     {{ info_row("URL", url_value()) }}
     {{ info_row("Public paths", public_paths_value()) }}
     {{ info_row("Local port", code_value(app.local_port)) }}
@@ -356,6 +378,10 @@ async function copyAppDiagnostics(btn) {
   "updateReviewUrl": "/update_review/{{ app.name }}",
   "appId": {{ app.app_id | tojson }},
   "setAppRemoteUrl": "/set_app_remote/{{ app.app_id }}",
+  "appTagsUrl": "/api/app_tags/{{ app.app_id }}",
+  "tags": {{ tags | tojson }},
+  "maxTagsPerApp": {{ max_tags_per_app }},
+  "maxTagLength": {{ max_tag_length }},
   "dropBuildCacheUrl": "/api/drop-docker-cache"
 }
 </script>

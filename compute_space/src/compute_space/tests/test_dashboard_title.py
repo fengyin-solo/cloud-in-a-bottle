@@ -167,6 +167,57 @@ def test_owner_name_global_reads_live(cfg: Any) -> None:
     assert owner_name() == "carol"
 
 
+def test_dashboard_renders_tag_chips_and_filter(cfg: Any) -> None:
+    """Tags show on app rows and as multi-select filter chips; an app with no
+    tags renders an empty (but present) data-tags attribute and no chip list."""
+    set_active_config(cfg)
+    cookie = auth_cookie(cfg, username="owner")
+    with sqlite3.connect(cfg.db_path) as conn:
+        conn.execute(
+            "INSERT INTO apps (app_id, name, version, repo_path, local_port, status) "
+            "VALUES ('tagged-id', 'tagged-app', '1.0', '/tmp/tagged-app', 19200, 'running'),"
+            "       ('plain-id', 'plain-app', '1.0', '/tmp/plain-app', 19201, 'stopped')"
+        )
+        conn.executemany(
+            "INSERT INTO app_tags (app_id, tag, position) VALUES (?, ?, ?)",
+            [("tagged-id", "media", 0), ("tagged-id", "personal", 1)],
+        )
+        conn.commit()
+
+    with TestClient(app=_build_app(cfg)) as client:
+        client.cookies.update(cookie)
+        resp = client.get("/dashboard")
+
+    assert resp.status_code == 200
+    # One filter chip + one row chip per tag.
+    assert resp.text.count('data-tag="media"') == 2
+    assert resp.text.count('data-tag="personal"') == 2
+    assert 'id="tag-filters"' in resp.text
+    assert 'aria-pressed="false"' in resp.text
+    # The untagged row still carries the JSON hook for client-side filtering.
+    assert "data-tags='[]'" in resp.text
+    # The New button and tag filter coexist (filter must not displace actions).
+    assert 'href="/add_app"' in resp.text
+
+
+def test_dashboard_has_no_tag_filter_without_tags(cfg: Any) -> None:
+    set_active_config(cfg)
+    cookie = auth_cookie(cfg, username="owner")
+    with sqlite3.connect(cfg.db_path) as conn:
+        conn.execute(
+            "INSERT INTO apps (app_id, name, version, repo_path, local_port, status) "
+            "VALUES ('plain-id', 'plain-app', '1.0', '/tmp/plain-app', 19201, 'stopped')"
+        )
+        conn.commit()
+
+    with TestClient(app=_build_app(cfg)) as client:
+        client.cookies.update(cookie)
+        resp = client.get("/dashboard")
+
+    assert resp.status_code == 200
+    assert 'id="tag-filters"' not in resp.text
+
+
 def test_zone_name_global_reads_live(tmp_path: Path) -> None:
     cfg = _make_test_config(tmp_path, zone_domain="alice-zone.example.com", seed_primary=False)
     init_db(cfg.db_path)

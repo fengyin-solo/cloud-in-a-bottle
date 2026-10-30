@@ -1,0 +1,13 @@
+{#- Non-interactive list of normalized tag chips. Tag values originate from
+    the app_tags table (normalized at write time) and are escaped here anyway
+    so the component is safe with arbitrary caller strings. The dashboard's
+    filter chips are separate <button> elements in dashboard.html. -#}
+{% macro tag_chips(tags, class_="") -%}
+{%- if tags -%}
+<ul class="tag-chips{% if class_ %} {{ class_ }}{% endif %}">
+  {%- for tag in tags -%}
+  <li class="tag-chip" data-tag="{{ tag }}">{{ tag }}</li>
+  {%- endfor -%}
+</ul>
+{%- endif -%}
+{%- endmacro %}

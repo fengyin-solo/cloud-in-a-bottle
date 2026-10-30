@@ -81,6 +81,74 @@ function saveRemote() {
     .catch(function() { errEl.textContent = 'Failed to save'; });
 }
 
+// ─── Tags ───
+
+function renderTagsChips(tags) {
+  // Rebuild the read-only tag set after a successful save. Same markup the
+  // server renders (ul.tag-chips > li.tag-chip); textContent keeps it XSS-safe.
+  var host = document.getElementById('tags-chips');
+  if (!host) return;
+  host.textContent = '';
+  if (!tags.length) {
+    var empty = document.createElement('span');
+    empty.className = 'muted';
+    empty.textContent = 'No tags.';
+    host.appendChild(empty);
+    return;
+  }
+  var ul = document.createElement('ul');
+  ul.className = 'tag-chips tag-chips--detail';
+  tags.forEach(function(tag) {
+    var li = document.createElement('li');
+    li.className = 'tag-chip';
+    li.setAttribute('data-tag', tag);
+    li.textContent = tag;
+    ul.appendChild(li);
+  });
+  host.appendChild(ul);
+}
+
+function editTags() {
+  document.getElementById('tags-display').hidden = true;
+  document.getElementById('tags-edit').hidden = false;
+  var input = document.getElementById('tags-input');
+  // Reopen from the saved set so Cancel/Save always start from canonical data.
+  input.value = config.tags.join(', ');
+  document.getElementById('tags-error').textContent = '';
+  input.focus();
+}
+
+function cancelTags() {
+  document.getElementById('tags-edit').hidden = true;
+  document.getElementById('tags-display').hidden = false;
+}
+
+function saveTags() {
+  var errEl = document.getElementById('tags-error');
+  errEl.textContent = '';
+  // The server performs the real normalization (trim, lowercase, dedupe,
+  // length/count limits); splitting on commas here is just transport.
+  var submitted = document.getElementById('tags-input').value
+    .split(',').map(function(t) { return t.trim(); }).filter(Boolean);
+  fetch(config.appTagsUrl, {
+    method: 'PUT',
+    credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({tags: submitted}),
+  })
+    .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, data: d}; }); })
+    .then(function(res) {
+      if (!res.ok) {
+        errEl.textContent = responseErrorMessage(res.data, 'Failed to save tags');
+        return;
+      }
+      config.tags = res.data.tags;
+      renderTagsChips(res.data.tags);
+      cancelTags();
+    })
+    .catch(function() { errEl.textContent = 'Failed to save tags'; });
+}
+
 // ─── App Actions (stop, reload, remove) ───
 
 function setActionsBusy(label) {

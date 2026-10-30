@@ -37,9 +37,21 @@
     <a class="btn btn--accent" href="/add_app">+ New</a>
   {% endcall %}
 
+  {% if tag_vocabulary %}
+  {#- Multi-select tag filter: an app must carry every pressed tag (AND).
+      Chips wrap on narrow screens and live above (never inside) the action
+      cluster, so they can't displace the New button. -#}
+  <div class="tag-filters" id="tag-filters" role="group" aria-label="Filter apps by tag">
+    {% for tag in tag_vocabulary %}
+    <button type="button" class="tag-chip tag-chip--toggle" data-tag="{{ tag }}"
+            aria-pressed="false">{{ tag }}</button>
+    {% endfor %}
+  </div>
+  {% endif %}
+
   {% if apps %}
   <div class="app-list" id="app-list">
-    {% for app in apps %}{{ app_row(app) }}{% endfor %}
+    {% for app in apps %}{{ app_row(app, tags_by_app.get(app.app_id, [])) }}{% endfor %}
   </div>
   <p class="empty" id="no-matches" hidden>No apps match that filter.</p>
   {% else %}

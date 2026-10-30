@@ -45,9 +45,23 @@ CREATE TABLE IF NOT EXISTS app_port_mappings (
     UNIQUE(app_id, label)
 );
 
+-- Owner-assigned normalized tags (e.g. productivity, media, internal,
+-- personal) used to browse/filter apps. One tag per row; ``position``
+-- preserves the owner-supplied order after normalization (duplicates
+-- collapse to their first occurrence). Empty by default; ON DELETE CASCADE
+-- removes a deleted app's tags together with its other child rows.
+CREATE TABLE IF NOT EXISTS app_tags (
+    app_id   TEXT NOT NULL,
+    tag      TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (app_id, tag),
+    FOREIGN KEY (app_id) REFERENCES apps(app_id) ON DELETE CASCADE
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_port_mappings_host_port ON app_port_mappings(host_port);
 CREATE INDEX IF NOT EXISTS idx_apps_status ON apps(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_apps_app_id ON apps(app_id);
+CREATE INDEX IF NOT EXISTS idx_app_tags_tag ON app_tags(tag);
 
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY AUTOINCREMENT,

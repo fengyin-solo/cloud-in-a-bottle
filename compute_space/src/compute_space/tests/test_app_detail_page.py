@@ -131,6 +131,55 @@ def test_app_detail_shows_active_public_paths(cfg: Config, public_paths: list[st
     assert '<script>alert("public-path")</script>' not in response.text
 
 
+def test_app_detail_renders_tags_editor_and_keeps_danger_actions(cfg: Config) -> None:
+    set_active_config(cfg)
+    with sqlite3.connect(cfg.db_path) as conn:
+        conn.execute(
+            """INSERT INTO apps (app_id, name, version, repo_path, local_port, status)
+               VALUES ('tags-app-id', 'tags-app', '1.0.0', '/tmp/tags-app', 19127, 'running')"""
+        )
+        conn.executemany(
+            "INSERT INTO app_tags (app_id, tag, position) VALUES (?, ?, ?)",
+            [("tags-app-id", "productivity", 0), ("tags-app-id", "media", 1)],
+        )
+        conn.commit()
+
+    with TestClient(app=_build_app(cfg)) as client:
+        client.cookies.update(auth_cookie(cfg))
+        response = client.get("/app_detail/tags-app")
+
+    assert response.status_code == 200
+    assert "<th scope=\"row\">Tags</th>" in response.text
+    assert 'data-tag="productivity"' in response.text
+    assert 'data-tag="media"' in response.text
+    # In-place editor wiring for app-detail.js.
+    assert '"/api/app_tags/tags-app-id"' in response.text
+    assert 'id="tags-input"' in response.text
+    assert 'onclick="saveTags()"' in response.text
+    # The destructive action buttons remain present and untouched.
+    assert "Remove App &amp; Data" in response.text
+    assert "Remove (Keep Data)" in response.text
+
+
+def test_app_detail_renders_empty_tags_state(cfg: Config) -> None:
+    set_active_config(cfg)
+    with sqlite3.connect(cfg.db_path) as conn:
+        conn.execute(
+            """INSERT INTO apps (app_id, name, version, repo_path, local_port, status)
+               VALUES ('untagged-app-id', 'untagged-app', '1.0.0', '/tmp/untagged-app', 19128, 'stopped')"""
+        )
+        conn.commit()
+
+    with TestClient(app=_build_app(cfg)) as client:
+        client.cookies.update(auth_cookie(cfg))
+        response = client.get("/app_detail/untagged-app")
+
+    assert response.status_code == 200
+    assert "<th scope=\"row\">Tags</th>" in response.text
+    assert "No tags." in response.text
+    assert 'data-tag=' not in response.text
+
+
 def test_app_detail_shows_private_default(cfg: Config) -> None:
     set_active_config(cfg)
     with sqlite3.connect(cfg.db_path) as conn:

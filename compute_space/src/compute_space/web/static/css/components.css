@@ -509,6 +509,83 @@ h2.section-title {
   color: var(--fg-status-warning);
 }
 
+/* ── Tags ──────────────────────────────────────────────────────────────
+   Small slug-like chips shown on app rows and the detail page, plus the
+   dashboard's multi-select filter buttons. Chips wrap freely so narrow
+   screens never push the row's Details link or the page's action buttons. */
+
+.tag-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+}
+
+.tag-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* On an app row the chip list takes a full-width wrapped line of its own;
+   it renders nothing (and so takes no space) when the app has no tags. */
+.app-row {
+  flex-wrap: wrap;
+}
+
+.tag-chips--row {
+  flex: 1 1 100%;
+}
+
+/* Inline in the detail table so the edit pencil stays beside the set. */
+.tag-chips--detail {
+  display: inline-flex;
+  vertical-align: middle;
+}
+
+#tags-chips {
+  display: inline;
+}
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px var(--space-2);
+  border: var(--border-w) solid var(--fg-border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--fg-secondary);
+  font-family: inherit;
+  font-size: var(--text-body-sm);
+  line-height: var(--leading-body-sm);
+  white-space: nowrap;
+  cursor: default;
+}
+
+button.tag-chip--toggle {
+  cursor: pointer;
+}
+
+button.tag-chip--toggle:hover {
+  background-image: linear-gradient(var(--interactive-hover), var(--interactive-hover));
+}
+
+button.tag-chip--toggle[aria-pressed="true"] {
+  background: var(--bg-status-info);
+  border-color: var(--fg-status-info);
+  color: var(--fg-status-info);
+  font-weight: var(--weight-emphasized);
+}
+
+button.tag-chip--toggle:focus-visible {
+  outline: 2px solid var(--fg-status-info);
+  outline-offset: 1px;
+}
+
 /* ── Search ─────────────────────────────────────────────────────────── */
 
 .search {
