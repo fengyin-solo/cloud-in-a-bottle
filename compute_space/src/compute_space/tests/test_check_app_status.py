@@ -180,6 +180,52 @@ def test_starting_app_with_live_container_is_recreated(tmp_path: Path, monkeypat
     assert _status(cfg, app_id) == "starting"
 
 
+def test_startup_recovery_records_history_only_for_real_transitions(tmp_path: Path, monkeypatch: Any) -> None:
+    cfg = _make_test_config(tmp_path, port=20900)
+    init_db(cfg.db_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(startup, "_PROCESS_START_UTC", "2020-01-01 00:00:00")
+
+    # Dead running app: queued for recovery, status flips to starting.
+    crashed = _seed_app(cfg, name="crashed", status="running", port=20910, container_id="dead", repo_path=str(repo))
+    # Live building app: reconciled straight to running without a rebuild.
+    live_build = _seed_app(
+        cfg, name="live-build", status="building", port=20911, container_id="live", repo_path=str(repo)
+    )
+    # starting row belonging to this process: left to its live deploy thread by
+    # the early guard, so the sweep touches neither its status nor its history.
+    current_start = _seed_app(
+        cfg,
+        name="this-process",
+        status="starting",
+        port=20912,
+        container_id=None,
+        repo_path=str(repo),
+        created_at="2020-01-02 00:00:00",
+    )
+
+    def fake_running(cid: str | None) -> bool:
+        return cid == "live"
+
+    monkeypatch.setattr(startup, "is_container_running", fake_running)
+    restarted, done = _capture_restart_sweep(monkeypatch)
+
+    startup.check_app_status(cfg)
+    assert done.wait(5)
+
+    rows = {
+        r[0]: (r[1], r[2], r[3])
+        for r in sqlite3.connect(cfg.db_path).execute(
+            "SELECT app_id, from_status, to_status, source FROM app_status_history ORDER BY seq"
+        )
+    }
+    assert rows[crashed] == ("running", "starting", "startup_recovery")
+    assert rows[live_build] == ("building", "running", "startup_recovery")
+    assert current_start not in rows
+    assert crashed in restarted
+
+
 def test_running_app_with_dead_container_is_restarted(tmp_path: Path, monkeypatch: Any) -> None:
     cfg = _make_test_config(tmp_path, port=20500)
     init_db(cfg.db_path)

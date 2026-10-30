@@ -5,6 +5,7 @@ from enum import StrEnum
 
 import attr
 
+from compute_space.core import app_status_history
 from compute_space.core.app_id import is_valid_app_name
 from compute_space.core.logging import logger
 
@@ -255,11 +256,26 @@ def set_primary_domain(db: sqlite3.Connection, name: str) -> bool:
         promoted = db.execute("UPDATE domains SET is_primary = 1 WHERE name = ? AND is_primary = 0", (target.name,))
         if demoted.rowcount != 1 or promoted.rowcount != 1:
             raise RuntimeError("Primary domain changed concurrently")
+        # Capture the exact rows the bulk UPDATE below will touch, so each can
+        # get a history row with its real previous status. The marker written
+        # into error_message is internal and never copied into history.
+        restarting = db.execute(
+            "SELECT app_id, status FROM apps "
+            "WHERE status = 'running' OR (status = 'error' AND container_id IS NOT NULL)"
+        ).fetchall()
         db.execute(
             "UPDATE apps SET status = 'starting', error_message = ? "
             "WHERE status = 'running' OR (status = 'error' AND container_id IS NOT NULL)",
             (PRIMARY_DOMAIN_RESTART_MARKER,),
         )
+        for restart_row in restarting:
+            app_status_history.record_known_transition(
+                db,
+                restart_row["app_id"],
+                restart_row["status"],
+                "starting",
+                source=app_status_history.SOURCE_DOMAIN_PROMOTION,
+            )
         db.execute("COMMIT")
         return True
     except BaseException:

@@ -334,6 +334,9 @@ function clearCacheAndReload() {
             appStatus = data.status;
             statusEl.textContent = appStatus;
             statusEl.className = 'status-value status-' + appStatus;
+            // Re-pull history only on a real transition, not on every poll,
+            // so a stable status never generates history traffic.
+            if (typeof refreshStatusHistory === 'function') refreshStatusHistory();
         }
         // Adopt the first container_id silently; reset only on a later change.
         if (data.container_id && data.container_id !== streamContainerId) {
@@ -397,3 +400,179 @@ function clearCacheAndReload() {
 // Grey out Save until the git upstream input actually differs from what's saved.
 var remoteInput = document.getElementById('remote-input');
 if (remoteInput) remoteInput.addEventListener('input', updateSaveRemoteState);
+
+// ─── Status history ───
+//
+// Fetched once on load and again only when the 1s status poll above observes a
+// real transition, so polling a stable app never generates history traffic.
+
+var STATUS_SOURCE_LABELS = {
+  install: 'App install',
+  reload: 'Manual reload',
+  update: 'Update and reload',
+  owner_stop: 'Stopped by owner',
+  owner_remove: 'Removal requested',
+  startup_recovery: 'Startup recovery',
+  storage_guard: 'Storage guard',
+  primary_domain_promotion: 'Primary domain change',
+  rename_restart: 'Restart after rename',
+  archive_migration: 'Archive storage migration',
+  system: 'System'
+};
+
+function historySourceLabel(source) {
+  return STATUS_SOURCE_LABELS[source] || source;
+}
+
+// changed_at is stored as UTC 'YYYY-MM-DD HH:MM:SS' (SQLite datetime('now')).
+function historyRelativeTime(value) {
+  var when = new Date(value.replace(' ', 'T') + 'Z');
+  if (isNaN(when.getTime())) return value;
+  var future = Date.now() - when.getTime() < 0;
+  var seconds = Math.abs(Math.round((Date.now() - when.getTime()) / 1000));
+  if (seconds < 45) return 'just now';
+  var amount;
+  var minutes = Math.round(seconds / 60);
+  if (minutes < 60) {
+    amount = minutes + ' minute' + (minutes === 1 ? '' : 's');
+  } else {
+    var hours = Math.round(minutes / 60);
+    if (hours < 48) {
+      amount = hours + ' hour' + (hours === 1 ? '' : 's');
+    } else {
+      var days = Math.round(hours / 24);
+      if (days < 30) {
+        amount = days + ' day' + (days === 1 ? '' : 's');
+      } else {
+        return when.toISOString().slice(0, 10);
+      }
+    }
+  }
+  return future ? 'in ' + amount : amount + ' ago';
+}
+
+function historyStatusSpan(status) {
+  var span = document.createElement('span');
+  span.className = 'status-value status-' + status;
+  span.textContent = status;
+  return span;
+}
+
+function historyEventRow(event) {
+  var li = document.createElement('li');
+  li.className = 'status-history__item';
+
+  var transition = document.createElement('span');
+  transition.className = 'status-history__transition';
+  if (event.from_status) {
+    transition.appendChild(historyStatusSpan(event.from_status));
+    transition.appendChild(document.createTextNode(' \u2192 '));
+  } else {
+    var created = document.createElement('span');
+    created.className = 'status-history__birth';
+    created.textContent = 'created';
+    transition.appendChild(created);
+    transition.appendChild(document.createTextNode(' \u2192 '));
+  }
+  transition.appendChild(historyStatusSpan(event.to_status));
+  li.appendChild(transition);
+
+  var meta = document.createElement('span');
+  meta.className = 'status-history__meta';
+  var time = document.createElement('time');
+  time.dateTime = event.changed_at.replace(' ', 'T') + 'Z';
+  time.title = event.changed_at + ' UTC';
+  time.textContent = historyRelativeTime(event.changed_at);
+  meta.appendChild(time);
+  meta.appendChild(document.createTextNode(' \u00b7 via ' + historySourceLabel(event.source)));
+  li.appendChild(meta);
+
+  if (event.error_message) {
+    var err = document.createElement('p');
+    err.className = 'status-history__error';
+    err.textContent = event.error_message;
+    li.appendChild(err);
+  }
+  return li;
+}
+
+function renderStatusHistory(data) {
+  var panel = document.getElementById('app-status-history');
+  if (!panel || !data) return;
+  var loadingEl = document.getElementById('status-history-loading');
+  var cluesEl = document.getElementById('status-history-clues');
+  var lastEl = document.getElementById('status-history-last');
+  var emptyEl = document.getElementById('status-history-empty');
+  var listEl = document.getElementById('status-history-list');
+  var truncatedEl = document.getElementById('status-history-truncated');
+  if (loadingEl) loadingEl.hidden = true;
+
+  var events = data.events || [];
+  var clues = data.failure_clues || {};
+
+  if (cluesEl) {
+    if (clues.error_count >= 2) {
+      var clueText = 'This app has failed ' + clues.error_count + ' times in the recent history.';
+      if (clues.last_error_at) clueText += ' Last failure: ' + historyRelativeTime(clues.last_error_at) + '.';
+      if (clues.attempts_since_last_running > 0) {
+        clueText += ' ' + clues.attempts_since_last_running + ' start attempt'
+          + (clues.attempts_since_last_running === 1 ? '' : 's') + ' since it last ran successfully.';
+      }
+      cluesEl.textContent = clueText;
+      cluesEl.hidden = false;
+    } else {
+      cluesEl.textContent = '';
+      cluesEl.hidden = true;
+    }
+  }
+
+  if (events.length === 0) {
+    if (emptyEl) emptyEl.hidden = false;
+    if (lastEl) lastEl.hidden = true;
+    if (listEl) { listEl.hidden = true; listEl.textContent = ''; }
+  } else {
+    if (emptyEl) emptyEl.hidden = true;
+
+    var latest = events[events.length - 1];
+    if (lastEl) {
+      lastEl.textContent = '';
+      lastEl.appendChild(document.createTextNode('Last change: '));
+      if (latest.from_status) {
+        lastEl.appendChild(historyStatusSpan(latest.from_status));
+        lastEl.appendChild(document.createTextNode(' \u2192 '));
+      }
+      lastEl.appendChild(historyStatusSpan(latest.to_status));
+      lastEl.appendChild(
+        document.createTextNode(', ' + historyRelativeTime(latest.changed_at) + ', via ' + historySourceLabel(latest.source))
+      );
+      lastEl.hidden = false;
+    }
+
+    if (listEl) {
+      listEl.textContent = '';
+      // API serves oldest to newest; the timeline reads bottom-up, newest last.
+      events.forEach(function(event) { listEl.appendChild(historyEventRow(event)); });
+      listEl.hidden = false;
+    }
+  }
+
+  if (truncatedEl) truncatedEl.hidden = !data.truncated;
+}
+
+function refreshStatusHistory() {
+  if (!config.appStatusHistoryUrl) return;
+  fetch(config.appStatusHistoryUrl, {credentials: 'same-origin'})
+    .then(function(r) {
+      if (r.status === 401) {
+        window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+        return null;
+      }
+      if (r.status === 404) { window.location.href = '/dashboard'; return null; }
+      if (!r.ok) return null;
+      return r.json();
+    })
+    .then(function(data) { renderStatusHistory(data); })
+    .catch(function() {});
+}
+
+refreshStatusHistory();

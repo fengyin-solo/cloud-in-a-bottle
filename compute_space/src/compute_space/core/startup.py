@@ -4,6 +4,7 @@ import threading
 import time
 
 from compute_space.config import Config
+from compute_space.core import app_status_history
 from compute_space.core.apps import restart_app_process
 from compute_space.core.apps import start_app_process
 from compute_space.core.containers import BUILD_CACHE_CORRUPT_MARKER
@@ -36,72 +37,83 @@ def check_app_status(config: Config) -> None:
     db.row_factory = sqlite3.Row
     apps_to_recover: list[tuple[str, bool]] = []
     promoted_apps_to_recover: list[tuple[str, bool]] = []
-    try:
-        rows = db.execute("SELECT * FROM apps WHERE status IN ('running', 'starting', 'building')").fetchall()
-        for row in rows:
-            alive = bool(row["container_id"]) and is_container_running(row["container_id"])
-            promotion_restart = row["status"] == "starting" and row["error_message"] == PRIMARY_DOMAIN_RESTART_MARKER
-
-            # A newly inserted row belongs to this process's deploy thread. It
-            # is not durable restart intent yet, even if podman is already up.
-            if not promotion_restart and row["status"] == "starting" and row["created_at"] >= _PROCESS_START_UTC:
-                continue
-
-            if alive and row["status"] != "starting":
-                # A completed build may have reached podman before its final DB
-                # update. A durable starting state, however, is restart intent.
-                if row["status"] == "building":
-                    db.execute(
-                        "UPDATE apps SET status = 'running' WHERE app_id = ?",
-                        (row["app_id"],),
-                    )
-                continue
-
-            repo_path = row["repo_path"]
-            has_repo = bool(repo_path) and os.path.isdir(repo_path)
-            has_manifest = bool(row["manifest_raw"]) or has_repo
-            image_tag = f"openhost-{row['name']}:latest"
-            needs_build = row["status"] == "building" or not image_exists(image_tag)
-            if not has_manifest or (needs_build and not has_repo):
-                db.execute(
-                    "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
-                    (
-                        f"Cannot recover: repo path missing ({repo_path})",
-                        row["app_id"],
-                    ),
+    with app_status_history.status_source(app_status_history.SOURCE_STARTUP_RECOVERY):
+        try:
+            rows = db.execute("SELECT * FROM apps WHERE status IN ('running', 'starting', 'building')").fetchall()
+            for row in rows:
+                alive = bool(row["container_id"]) and is_container_running(row["container_id"])
+                promotion_restart = (
+                    row["status"] == "starting" and row["error_message"] == PRIMARY_DOMAIN_RESTART_MARKER
                 )
-                continue
 
-            if not row["container_id"]:
-                # No container yet — run_container() hadn't been called when the
-                # process was killed.  Rows created after this process started have
-                # an active deploy_app_background thread still running; mark them
-                # starting so the dashboard reflects that, but don't queue a second
-                # build.
-                if not promotion_restart and row["created_at"] >= _PROCESS_START_UTC:
+                # A newly inserted row belongs to this process's deploy thread. It
+                # is not durable restart intent yet, even if podman is already up.
+                if not promotion_restart and row["status"] == "starting" and row["created_at"] >= _PROCESS_START_UTC:
+                    continue
+
+                if alive and row["status"] != "starting":
+                    # A completed build may have reached podman before its final DB
+                    # update. A durable starting state, however, is restart intent.
+                    if row["status"] == "building":
+                        app_status_history.record_transition(db, row["app_id"], "running")
+                        db.execute(
+                            "UPDATE apps SET status = 'running' WHERE app_id = ?",
+                            (row["app_id"],),
+                        )
+                    continue
+
+                repo_path = row["repo_path"]
+                has_repo = bool(repo_path) and os.path.isdir(repo_path)
+                has_manifest = bool(row["manifest_raw"]) or has_repo
+                image_tag = f"openhost-{row['name']}:latest"
+                needs_build = row["status"] == "building" or not image_exists(image_tag)
+                if not has_manifest or (needs_build and not has_repo):
+                    missing_error = f"Cannot recover: repo path missing ({repo_path})"
+                    app_status_history.record_transition(db, row["app_id"], "error", error_message=missing_error)
                     db.execute(
-                        "UPDATE apps SET status = 'starting' WHERE app_id = ?",
-                        (row["app_id"],),
+                        "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
+                        (missing_error, row["app_id"]),
                     )
                     continue
 
-            db.execute(
-                "UPDATE apps SET status = 'starting' WHERE app_id = ?",
-                (row["app_id"],),
-            )
-            recovery = (row["app_id"], needs_build)
-            if promotion_restart:
-                promoted_apps_to_recover.append(recovery)
-            else:
-                apps_to_recover.append(recovery)
+                if not row["container_id"]:
+                    # No container yet; run_container() hadn't been called when the
+                    # process was killed.  Rows created after this process started have
+                    # an active deploy_app_background thread still running; mark them
+                    # starting so the dashboard reflects that, but don't queue a second
+                    # build.
+                    if not promotion_restart and row["created_at"] >= _PROCESS_START_UTC:
+                        # starting -> starting: the recorder dedupes this, so no
+                        # history row is created for the repeated mark.
+                        app_status_history.record_transition(
+                            db, row["app_id"], "starting", error_message=app_status_history.LEAVE
+                        )
+                        db.execute(
+                            "UPDATE apps SET status = 'starting' WHERE app_id = ?",
+                            (row["app_id"],),
+                        )
+                        continue
 
-        # Recover apps whose build corrupted containers-storage onto the same
-        # serial rebuild path (which exists precisely to avoid that corruption).
-        apps_to_recover.extend((app_id, True) for app_id in _recover_cache_corrupt_apps(db))
+                app_status_history.record_transition(
+                    db, row["app_id"], "starting", error_message=app_status_history.LEAVE
+                )
+                db.execute(
+                    "UPDATE apps SET status = 'starting' WHERE app_id = ?",
+                    (row["app_id"],),
+                )
+                recovery = (row["app_id"], needs_build)
+                if promotion_restart:
+                    promoted_apps_to_recover.append(recovery)
+                else:
+                    apps_to_recover.append(recovery)
 
-        db.commit()
-    finally:
-        db.close()
+            # Recover apps whose build corrupted containers-storage onto the same
+            # serial rebuild path (which exists precisely to avoid that corruption).
+            apps_to_recover.extend((app_id, True) for app_id in _recover_cache_corrupt_apps(db))
+
+            db.commit()
+        finally:
+            db.close()
 
     if promoted_apps_to_recover:
         _restart_apps_sequential(promoted_apps_to_recover, config)
@@ -146,6 +158,7 @@ def _recover_cache_corrupt_apps(db: sqlite3.Connection) -> list[str]:
         logger.error("failed to drop build cache during corruption recovery: {}", e)
 
     for app_id in corrupt:
+        app_status_history.record_transition(db, app_id, "starting", error_message=None)
         db.execute(
             "UPDATE apps SET status = 'starting', error_message = NULL WHERE app_id = ?",
             (app_id,),
@@ -158,23 +171,25 @@ def _restart_apps_sequential(apps: list[tuple[str, bool]], config: Config) -> No
     db = sqlite3.connect(config.db_path, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
-    try:
-        for app_id, needs_build in apps:
-            try:
-                if needs_build:
-                    start_app_process(app_id, db, config)
-                else:
-                    restart_app_process(app_id, db, config)
-                logger.info("Recovered app {} ({})", app_id, "rebuilt" if needs_build else "restarted")
-            except Exception as e:
-                logger.exception("Failed to recover app {}", app_id)
-                db.execute(
-                    "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
-                    (str(e), app_id),
-                )
-                db.commit()
-    finally:
-        db.close()
+    with app_status_history.status_source(app_status_history.SOURCE_STARTUP_RECOVERY):
+        try:
+            for app_id, needs_build in apps:
+                try:
+                    if needs_build:
+                        start_app_process(app_id, db, config)
+                    else:
+                        restart_app_process(app_id, db, config)
+                    logger.info("Recovered app {} ({})", app_id, "rebuilt" if needs_build else "restarted")
+                except Exception as e:
+                    logger.exception("Failed to recover app {}", app_id)
+                    app_status_history.record_transition(db, app_id, "error", error_message=str(e))
+                    db.execute(
+                        "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
+                        (str(e), app_id),
+                    )
+                    db.commit()
+        finally:
+            db.close()
 
 
 def retry_pending_default_apps(config: Config) -> None:

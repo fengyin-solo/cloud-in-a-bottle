@@ -33,6 +33,7 @@ from litestar.params import Parameter
 from litestar.response import Redirect
 
 from compute_space.config import Config
+from compute_space.core import app_status_history
 from compute_space.core import archive_backend
 from compute_space.core.app_id import is_valid_app_id
 from compute_space.core.apps import RESERVED_PATHS
@@ -172,6 +173,42 @@ class AppStatusResponse:
     git_dirty: bool | None = None
     container_id: str | None = None
     repo_url: str | None = None
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class StatusHistoryEvent:
+    """One real status transition, oldest to newest inside the response."""
+
+    from_status: str | None
+    to_status: str
+    changed_at: str
+    error_message: str | None
+    source: str
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class FailureCluesResponse:
+    """Repeated-failure hints derived from the returned history window."""
+
+    error_count: int
+    last_error_at: str | None
+    attempts_since_last_running: int
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class AppStatusHistoryResponse:
+    app_id: str
+    current_status: str
+    # Window size actually applied (the query param is clamped to 1..HISTORY_LIMIT).
+    limit: int
+    # Rows returned in this window.
+    returned: int
+    # Rows retained for the app after retention pruning.
+    retained: int
+    # True when retention pruning dropped older events (a gap exists in seq).
+    truncated: bool
+    events: list[StatusHistoryEvent]
+    failure_clues: FailureCluesResponse
 
 
 @attr.s(auto_attribs=True, frozen=True)
@@ -525,6 +562,59 @@ async def app_status(app_id: FromPath[str], db: NamedDependency[sqlite3.Connecti
     )
 
 
+@get(
+    "/api/app_status_history/{app_id:str}",
+    guards=[require_owner_auth],
+    raises=[ValidationException, NotFoundException],
+)
+async def app_status_history_route(
+    app_id: FromPath[str],
+    db: NamedDependency[sqlite3.Connection],
+    limit: FromQuery[int] = app_status_history.DEFAULT_FETCH_LIMIT,
+) -> Response[AppStatusHistoryResponse]:
+    """Return the app's recent real status transitions and failure clues.
+
+    Read-only companion to /api/app_status: it never writes status, so polling
+    it can not manufacture history. ``limit`` is clamped to 1..HISTORY_LIMIT;
+    the oldest retained events may have been pruned, reported via ``truncated``.
+    Events run oldest to newest. Apps that predate the feature return an empty
+    list with their current status intact.
+    """
+    if not is_valid_app_id(app_id):
+        raise ValidationException(detail="Invalid app_id")
+    window = app_status_history.get_history_window(db, app_id, limit=limit)
+    if window is None:
+        raise NotFoundException(detail="App not found")
+    clues = app_status_history.derive_failure_clues(window.events)
+    return Response(
+        content=AppStatusHistoryResponse(
+            app_id=app_id,
+            current_status=window.current_status,
+            limit=window.limit,
+            returned=window.returned,
+            retained=window.retained,
+            truncated=window.truncated,
+            events=[
+                StatusHistoryEvent(
+                    from_status=event.from_status,
+                    to_status=event.to_status,
+                    changed_at=event.changed_at,
+                    error_message=event.error_message,
+                    source=event.source,
+                )
+                for event in window.events
+            ],
+            failure_clues=FailureCluesResponse(
+                error_count=clues.error_count,
+                last_error_at=clues.last_error_at,
+                attempts_since_last_running=clues.attempts_since_last_running,
+            ),
+        ),
+        status_code=200,
+        media_type=MediaType.JSON,
+    )
+
+
 def _app_diagnostics_filename(app_name: str) -> str:
     """Build a safe, timestamped filename for a downloaded app diagnostics bundle."""
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -652,6 +742,13 @@ async def stop_app(app_id: FromPath[str], db: NamedDependency[sqlite3.Connection
 
     stop_app_process(app_row)
     stop_container(f"openhost-{app_row['name']}")
+    app_status_history.record_transition(
+        db,
+        app_id,
+        "stopped",
+        error_message=app_status_history.LEAVE,
+        source=app_status_history.SOURCE_OWNER_STOP,
+    )
     db.execute(
         "UPDATE apps SET status = 'stopped', container_id = NULL WHERE app_id = ?",
         (app_id,),
@@ -722,6 +819,12 @@ async def _reload_app_impl(
         raise ConflictException(detail="App is being removed")
     app_name = app_row["name"]
 
+    # Trigger source stored on every history row this action creates: pulling
+    # new code is "update", rebuilding the checkout already on disk is "reload".
+    reload_source = (
+        app_status_history.SOURCE_UPDATE if (update or continue_oauth) else app_status_history.SOURCE_RELOAD
+    )
+
     # The archive tier is a JuiceFS mount for both the local and S3 backends;
     # refuse to reload an app that hard-requires it while that mount is down.
     if not archive_backend.is_archive_dir_healthy(config, db):
@@ -755,12 +858,15 @@ async def _reload_app_impl(
 
         if update or continue_oauth:
             if not app_row["repo_path"] or not os.path.isdir(os.path.join(app_row["repo_path"], ".git")):
+                no_git_error = (
+                    "No git repository found to update. If this is a builtin app, git-based updates are not possible."
+                )
+                app_status_history.record_transition(
+                    db, app_id, "error", error_message=no_git_error, source=reload_source
+                )
                 db.execute(
                     "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
-                    (
-                        "No git repository found to update. If this is a builtin app, git-based updates are not possible.",
-                        app_id,
-                    ),
+                    (no_git_error, app_id),
                 )
                 db.commit()
                 return Response(content=OkResponse(ok=True), status_code=200, media_type=MediaType.JSON)
@@ -796,6 +902,9 @@ async def _reload_app_impl(
                     return Redirect(path=e.authorize_url)
                 except RuntimeError as e:
                     lf.write(f"Secrets service unavailable: {str(e)}\n")
+                    app_status_history.record_transition(
+                        db, app_id, "error", error_message=str(e), source=reload_source
+                    )
                     db.execute(
                         "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
                         (str(e), app_id),
@@ -815,9 +924,13 @@ async def _reload_app_impl(
                 )
 
             if not pull_ok:
+                pull_error = f"Git pull failed: {pull_err}"
+                app_status_history.record_transition(
+                    db, app_id, "error", error_message=pull_error, source=reload_source
+                )
                 db.execute(
                     "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
-                    (f"Git pull failed: {pull_err}", app_id),
+                    (pull_error, app_id),
                 )
                 db.commit()
                 if continue_oauth:
@@ -882,11 +995,20 @@ async def _reload_app_impl(
     # this same request already began on its initial POST (status is still the
     # pre-reload one, since the POST bounced to OAuth before claiming), so it
     # proceeds regardless of the rowcount.
+    previous_status = app_row["status"]
     cursor = db.execute(
         "UPDATE apps SET status = 'building', container_id = NULL, error_message = NULL "
         "WHERE app_id = ? AND status NOT IN ('building', 'starting', 'removing')",
         (app_id,),
     )
+    if cursor.rowcount == 1:
+        app_status_history.record_known_transition(
+            db,
+            app_id,
+            previous_status,
+            "building",
+            source=reload_source,
+        )
     db.commit()
     if cursor.rowcount == 0 and not continue_oauth:
         raise ConflictException(detail="App is already reloading")
@@ -896,6 +1018,7 @@ async def _reload_app_impl(
     Thread(
         target=reload_app_background,
         args=(app_id, app_row["repo_path"], config),
+        kwargs={"source": reload_source},
         daemon=True,
     ).start()
 
@@ -998,10 +1121,19 @@ async def remove_app(
     # Atomic claim: ``WHERE status != 'removing'`` makes concurrent
     # POSTs safe — only the first one gets rowcount=1 and spawns a
     # worker; later ones short-circuit to the already_removing branch.
+    previous_status = app_row["status"]
     cursor = db.execute(
         "UPDATE apps SET status = 'removing', error_message = NULL WHERE app_id = ? AND status != 'removing'",
         (app_id,),
     )
+    if cursor.rowcount == 1:
+        app_status_history.record_known_transition(
+            db,
+            app_id,
+            previous_status,
+            "removing",
+            source=app_status_history.SOURCE_OWNER_REMOVE,
+        )
     db.commit()
 
     if cursor.rowcount == 0:
@@ -1021,9 +1153,17 @@ async def remove_app(
         # Thread spawn failed (resource exhaustion). Roll the row back
         # to 'error' so a retry can re-claim it via the atomic UPDATE.
         logger.exception("Could not spawn remove worker for {}", app_id)
+        spawn_error = f"Could not start removal worker: {e}"
+        app_status_history.record_transition(
+            db,
+            app_id,
+            "error",
+            error_message=spawn_error,
+            source=app_status_history.SOURCE_OWNER_REMOVE,
+        )
         db.execute(
             "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
-            (f"Could not start removal worker: {e}", app_id),
+            (spawn_error, app_id),
         )
         db.commit()
         raise ServiceUnavailableException(detail="Could not start removal worker; try again.") from e
@@ -1139,6 +1279,13 @@ async def rename_app(
     prior_container_id = app_row["container_id"]
     was_running = prior_status in ("running", "starting", "building")
     stop_app_process(app_row)
+    app_status_history.record_transition(
+        db,
+        app_id,
+        "stopped",
+        error_message=app_status_history.LEAVE,
+        source=app_status_history.SOURCE_RENAME_RESTART,
+    )
     db.execute(
         "UPDATE apps SET status = 'stopped', container_id = NULL WHERE app_id = ?",
         (app_id,),
@@ -1156,6 +1303,13 @@ async def rename_app(
     if rename_error is not None:
         rollback_db_error: str | None = None
         try:
+            app_status_history.record_transition(
+                db,
+                app_id,
+                prior_status,
+                error_message=app_status_history.LEAVE,
+                source=app_status_history.SOURCE_RENAME_RESTART,
+            )
             db.execute(
                 "UPDATE apps SET status = ?, container_id = ? WHERE app_id = ?",
                 (prior_status, prior_container_id, app_id),
@@ -1193,9 +1347,17 @@ async def rename_app(
         # has already succeeded, and the dashboard needs a visible error
         # on the app rather than a generic server error.
         try:
-            start_app_process(app_id, db, config)
+            with app_status_history.status_source(app_status_history.SOURCE_RENAME_RESTART):
+                start_app_process(app_id, db, config)
         except (RuntimeError, ValueError) as e:
             logger.warning("Failed to restart {} after rename: {}", new_name, e)
+            app_status_history.record_transition(
+                db,
+                app_id,
+                "error",
+                error_message=str(e),
+                source=app_status_history.SOURCE_RENAME_RESTART,
+            )
             db.execute(
                 "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
                 (str(e), app_id),
@@ -1264,6 +1426,7 @@ api_apps_routes = Router(
         api_add_app,
         api_apps,
         app_status,
+        app_status_history_route,
         app_diagnostics,
         app_logs,
         app_logs_stream,

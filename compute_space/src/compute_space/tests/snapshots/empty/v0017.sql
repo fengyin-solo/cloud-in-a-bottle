@@ -23,6 +23,25 @@ CREATE TABLE "app_port_mappings" (
                 FOREIGN KEY (app_id) REFERENCES apps(app_id) ON DELETE CASCADE,
                 UNIQUE(app_id, label)
             );
+CREATE TABLE app_status_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id TEXT NOT NULL,
+    -- Per-app monotonic event number (1, 2, 3, ...); retained across pruning
+    -- so a gap between MIN(seq) and the row count signals truncation.
+    seq INTEGER NOT NULL,
+    -- NULL only on the install-time birth row (NULL -> 'building').
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    changed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    error_message TEXT,
+    -- Stable trigger-source identifier; see core/app_status_history.py for
+    -- the vocabulary (install, owner_stop, startup_recovery, ...).
+    source TEXT NOT NULL,
+    FOREIGN KEY (app_id) REFERENCES apps(app_id) ON DELETE CASCADE,
+    UNIQUE(app_id, seq),
+    CHECK (from_status IS NULL OR from_status IN ('building', 'starting', 'running', 'stopped', 'error', 'removing')),
+    CHECK (to_status IN ('building', 'starting', 'running', 'stopped', 'error', 'removing'))
+);
 CREATE TABLE "app_tokens" (
                 app_id TEXT PRIMARY KEY,
                 token_hash TEXT NOT NULL UNIQUE,
@@ -86,7 +105,7 @@ CREATE TABLE schema_version (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     version INTEGER NOT NULL
 );
-INSERT INTO "schema_version" VALUES(1,16);
+INSERT INTO "schema_version" VALUES(1,17);
 CREATE TABLE "service_defaults" (
                 service_url TEXT PRIMARY KEY,
                 app_id TEXT NOT NULL,
@@ -121,4 +140,5 @@ CREATE UNIQUE INDEX idx_apps_app_id ON apps(app_id);
 CREATE UNIQUE INDEX idx_port_mappings_host_port ON app_port_mappings(host_port);
 CREATE INDEX sessions_user_id_idx ON sessions(user_id);
 CREATE UNIQUE INDEX idx_domains_one_primary ON domains(is_primary) WHERE is_primary = 1;
+CREATE INDEX idx_app_status_history_app_seq ON app_status_history(app_id, seq);
 COMMIT;

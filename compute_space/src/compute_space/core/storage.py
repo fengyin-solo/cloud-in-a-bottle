@@ -19,6 +19,7 @@ import threading
 import time
 
 from compute_space.config import Config
+from compute_space.core import app_status_history
 from compute_space.core.containers import container_image_storage_bytes
 from compute_space.core.containers import stop_app_process
 from compute_space.core.logging import logger
@@ -260,6 +261,13 @@ def enforce_storage_guard(config: Config) -> None:
             detail = "Storage too low. Free space by removing app data or resizing disks."
             logger.warning("Stopping app {} due to low storage", row["name"])
             _stop_app_process_safe(row)
+            app_status_history.record_transition(
+                db,
+                row["app_id"],
+                "error",
+                error_message=detail,
+                source=app_status_history.SOURCE_STORAGE_GUARD,
+            )
             db.execute(
                 "UPDATE apps SET status = 'error', error_message = ?, container_id = NULL WHERE app_id = ?",
                 (detail, row["app_id"]),

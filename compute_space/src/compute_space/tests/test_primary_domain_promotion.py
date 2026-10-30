@@ -81,6 +81,18 @@ def test_promotion_atomically_marks_only_active_apps_starting(tmp_path: Path) ->
         }
         assert claimed == {"running": PRIMARY_DOMAIN_RESTART_MARKER, "live-error": PRIMARY_DOMAIN_RESTART_MARKER}
 
+        # Status history records one transition per restarted app with its real
+        # previous status; untouched apps get nothing, and the internal restart
+        # marker never leaks into history.error_message.
+        history = db.execute(
+            "SELECT app_id, from_status, to_status, error_message, source FROM app_status_history ORDER BY app_id"
+        ).fetchall()
+        assert [(r["app_id"], r["from_status"], r["to_status"], r["source"]) for r in history] == [
+            ("live-error-id", "error", "starting", "primary_domain_promotion"),
+            ("running-id", "running", "starting", "primary_domain_promotion"),
+        ]
+        assert all(r["error_message"] is None for r in history)
+
 
 def test_promoting_current_domain_is_idempotent(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)

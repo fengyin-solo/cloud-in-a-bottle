@@ -374,6 +374,11 @@ def test_install_writes_same_manifest_columns_as_helper(cfg: Any, tmp_path: Path
         with mock.patch.object(apps_mod, "deploy_app_background"):
             app_id = insert_and_deploy(manifest, str(repo), cfg, db)
         row = db.execute("SELECT * FROM apps WHERE app_id = ?", (app_id,)).fetchone()
+        # The install writes the NULL -> building birth row in the same tx.
+        history = db.execute(
+            "SELECT from_status, to_status, source FROM app_status_history WHERE app_id = ?",
+            (app_id,),
+        ).fetchall()
     finally:
         db.close()
 
@@ -382,3 +387,4 @@ def test_install_writes_same_manifest_columns_as_helper(cfg: Any, tmp_path: Path
     # Non-manifest install-only columns are set by insert_and_deploy itself.
     assert row["status"] == "building"
     assert row["repo_path"] == str(repo)
+    assert [tuple(r) for r in history] == [(None, "building", "install")]

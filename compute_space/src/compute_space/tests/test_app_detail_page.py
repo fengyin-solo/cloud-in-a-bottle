@@ -131,6 +131,31 @@ def test_app_detail_shows_active_public_paths(cfg: Config, public_paths: list[st
     assert '<script>alert("public-path")</script>' not in response.text
 
 
+def test_app_detail_renders_status_history_section(cfg: Config) -> None:
+    """The history UI is server-rendered as a container; data is filled from
+    the owner-only API by app-detail.js."""
+    set_active_config(cfg)
+    with sqlite3.connect(cfg.db_path) as conn:
+        conn.execute(
+            """INSERT INTO apps (app_id, name, version, repo_path, local_port, status)
+               VALUES ('history-app-id', 'history-app', '1.0.0', '/tmp/history-app', 19127, 'running')"""
+        )
+
+    with TestClient(app=_build_app(cfg)) as client:
+        client.cookies.update(auth_cookie(cfg))
+        response = client.get("/app_detail/history-app")
+
+    assert response.status_code == 200
+    html = response.text
+    assert 'id="app-status-history"' in html
+    assert 'id="status-history-list"' in html
+    assert 'id="status-history-empty"' in html
+    assert 'id="status-history-clues"' in html
+    assert 'id="status-history-truncated"' in html
+    assert '"/api/app_status_history/history-app-id"' in html
+    assert "No status transitions recorded yet." in html
+
+
 def test_app_detail_shows_private_default(cfg: Config) -> None:
     set_active_config(cfg)
     with sqlite3.connect(cfg.db_path) as conn:

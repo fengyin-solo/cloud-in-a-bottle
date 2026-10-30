@@ -16,6 +16,7 @@ import httpx
 
 import compute_space.core.storage as storage
 from compute_space.config import Config
+from compute_space.core import app_status_history
 from compute_space.core import archive_backend
 from compute_space.core.app_id import is_valid_app_name
 from compute_space.core.app_id import new_app_id
@@ -393,6 +394,10 @@ def insert_and_deploy(
 
     register_services_provided_by_app(app_id, manifest, db)
 
+    # Birth row (NULL -> building) for the transition history. Same tx as the
+    # apps INSERT, so it can not outlive a failed install.
+    app_status_history.record_initial(db, app_id)
+
     db.commit()
 
     if permissions_v2_grants:
@@ -428,28 +433,32 @@ def deploy_app_background(
     db = sqlite3.connect(config.db_path, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
-    try:
-        storage.check_before_deploy(config)
+    with app_status_history.status_source(app_status_history.SOURCE_INSTALL):
+        try:
+            storage.check_before_deploy(config)
 
-        _build_then_run_app(
-            app_id,
-            app_name,
-            repo_path,
-            manifest,
-            db,
-            config,
-            max_build_attempts=3,
-            env_vars=env_vars,
-        )
-    except Exception as e:
-        logger.exception("Failed to deploy {}", app_name)
-        db.execute(
-            "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
-            (str(e), app_id),
-        )
-        db.commit()
-    finally:
-        db.close()
+            _build_then_run_app(
+                app_id,
+                app_name,
+                repo_path,
+                manifest,
+                db,
+                config,
+                max_build_attempts=3,
+                env_vars=env_vars,
+            )
+        except Exception as e:
+            logger.exception("Failed to deploy {}", app_name)
+            app_status_history.record_transition(
+                db, app_id, "error", error_message=str(e), source=app_status_history.SOURCE_INSTALL
+            )
+            db.execute(
+                "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
+                (str(e), app_id),
+            )
+            db.commit()
+        finally:
+            db.close()
 
 
 def wait_for_ready(local_port: int, timeout: int = 60) -> bool:
@@ -483,6 +492,10 @@ def _load_port_mappings_from_db(app_id: str, db: sqlite3.Connection) -> list[Por
 
 def _mark_app_starting(db: sqlite3.Connection, app_id: str) -> None:
     """Keep durable promotion recovery intent until launch reaches a terminal state."""
+    # The UPDATE preserves a primary-domain-restart marker in error_message;
+    # LEAVE keeps that internal marker out of the history row. A repeated
+    # starting -> starting mark records nothing.
+    app_status_history.record_transition(db, app_id, "starting", error_message=app_status_history.LEAVE)
     db.execute(
         "UPDATE apps SET status = 'starting', "
         "error_message = CASE WHEN error_message = ? THEN error_message ELSE NULL END "
@@ -561,14 +574,17 @@ def run_app_image(
         db.commit()
 
         if wait_for_ready(local_port):
+            app_status_history.record_transition(db, app_id, "running", error_message=None)
             db.execute(
                 "UPDATE apps SET status = 'running', error_message = NULL WHERE app_id = ?",
                 (app_id,),
             )
         else:
+            not_ready_error = "App started but not responding to HTTP"
+            app_status_history.record_transition(db, app_id, "error", error_message=not_ready_error)
             db.execute(
                 "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
-                ("App started but not responding to HTTP", app_id),
+                (not_ready_error, app_id),
             )
         db.commit()
     except Exception as e:
@@ -584,6 +600,7 @@ def run_app_image(
         if not launch_started:
             persisted_container_id = app_row["container_id"]
         try:
+            app_status_history.record_transition(db, app_id, "error", error_message=str(e))
             db.execute(
                 "UPDATE apps SET status = 'error', error_message = ?, container_id = ? WHERE app_id = ?",
                 (str(e), persisted_container_id, app_id),
@@ -705,7 +722,8 @@ def restart_apps_by_id(app_ids: list[str], db: sqlite3.Connection, config: Confi
     ``stop_running_archive_apps`` for the migration quiesce/resume dance."""
     for app_id in app_ids:
         try:
-            restart_app_process(app_id, db, config)
+            with app_status_history.status_source(app_status_history.SOURCE_ARCHIVE_MIGRATION):
+                restart_app_process(app_id, db, config)
         except Exception:
             logger.exception("failed to restart app {} after archive migration remount", app_id)
 
@@ -973,11 +991,24 @@ def git_pull(
             )
 
 
-def reload_app_background(app_id: str, repo_path: str, config: Config) -> None:
+def reload_app_background(
+    app_id: str,
+    repo_path: str,
+    config: Config,
+    source: str = app_status_history.SOURCE_RELOAD,
+) -> None:
     """Reload an app in a background thread: re-read manifest, rebuild, start."""
     db = sqlite3.connect(config.db_path, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
+    with app_status_history.status_source(source):
+        _reload_app_background_inner(db, app_id, repo_path, config, source)
+    db.close()
+
+
+def _reload_app_background_inner(
+    db: sqlite3.Connection, app_id: str, repo_path: str, config: Config, source: str
+) -> None:
     try:
         app_row = db.execute("SELECT name FROM apps WHERE app_id = ?", (app_id,)).fetchone()
         if app_row is None:
@@ -1044,13 +1075,12 @@ def reload_app_background(app_id: str, repo_path: str, config: Config) -> None:
         start_app_process(app_id, db, config)
     except Exception as e:
         logger.exception("Failed to reload {}", app_id)
+        app_status_history.record_transition(db, app_id, "error", error_message=str(e), source=source)
         db.execute(
             "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
             (str(e), app_id),
         )
         db.commit()
-    finally:
-        db.close()
 
 
 def remove_app_background(app_id: str, keep_data: bool, config: Config) -> None:
@@ -1069,48 +1099,55 @@ def remove_app_background(app_id: str, keep_data: bool, config: Config) -> None:
     # the final DELETE wouldn't cascade and child rows in app_tokens,
     # permissions, etc. would be orphaned.
     db.execute("PRAGMA foreign_keys = ON")
-    try:
-        app_row = db.execute("SELECT * FROM apps WHERE app_id = ?", (app_id,)).fetchone()
-        if app_row is None:
-            return
-        app_name = app_row["name"]
+    with app_status_history.status_source(app_status_history.SOURCE_OWNER_REMOVE):
+        try:
+            app_row = db.execute("SELECT * FROM apps WHERE app_id = ?", (app_id,)).fetchone()
+            if app_row is None:
+                return
+            app_name = app_row["name"]
 
-        try:
-            stop_app_process(app_row)
-        except Exception:
-            logger.exception("stop_app_process failed during remove of {}", app_name)
-        try:
-            remove_image(app_name)
-        except Exception:
-            logger.exception("remove_image failed during remove of {}", app_name)
-        try:
-            if keep_data:
-                deprovision_temp_data(app_name, config.temporary_data_dir)
-            else:
-                deprovision_data(
-                    app_name,
-                    config.persistent_data_dir,
-                    config.temporary_data_dir,
-                    archive_backend.effective_archive_dir(config, db),
-                )
-        except Exception:
-            logger.exception("Failed to deprovision data for {}", app_name)
+            try:
+                stop_app_process(app_row)
+            except Exception:
+                logger.exception("stop_app_process failed during remove of {}", app_name)
+            try:
+                remove_image(app_name)
+            except Exception:
+                logger.exception("remove_image failed during remove of {}", app_name)
+            try:
+                if keep_data:
+                    deprovision_temp_data(app_name, config.temporary_data_dir)
+                else:
+                    deprovision_data(
+                        app_name,
+                        config.persistent_data_dir,
+                        config.temporary_data_dir,
+                        archive_backend.effective_archive_dir(config, db),
+                    )
+            except Exception:
+                logger.exception("Failed to deprovision data for {}", app_name)
 
-        db.execute("DELETE FROM apps WHERE app_id = ?", (app_id,))
-        db.commit()
-        logger.info("Removed app {} (keep_data={})", app_name, keep_data)
-    except Exception:
-        logger.exception("remove_app_background failed for {}", app_id)
-        try:
-            db.execute(
-                "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
-                ("Removal failed; retry from the dashboard. See server logs for details.", app_id),
-            )
+            db.execute("DELETE FROM apps WHERE app_id = ?", (app_id,))
             db.commit()
-        except sqlite3.Error:
-            logger.exception("Could not record removal failure for {}", app_id)
-    finally:
-        db.close()
+            logger.info("Removed app {} (keep_data={})", app_name, keep_data)
+        except Exception:
+            logger.exception("remove_app_background failed for {}", app_id)
+            try:
+                app_status_history.record_transition(
+                    db,
+                    app_id,
+                    "error",
+                    error_message="Removal failed; retry from the dashboard. See server logs for details.",
+                )
+                db.execute(
+                    "UPDATE apps SET status = 'error', error_message = ? WHERE app_id = ?",
+                    ("Removal failed; retry from the dashboard. See server logs for details.", app_id),
+                )
+                db.commit()
+            except sqlite3.Error:
+                logger.exception("Could not record removal failure for {}", app_id)
+        finally:
+            db.close()
 
 
 def get_app_from_hostname(host: str, db: sqlite3.Connection) -> App | None:

@@ -111,6 +111,20 @@ None. All paths require Cloud in a Bottle login.
   {% endcall %}
 </section>
 
+<section class="section">
+  {% call section_head("Status history", level=3) %}{% endcall %}
+  <div id="app-status-history" class="status-history-panel" aria-live="polite">
+    <p class="hint" id="status-history-loading">Loading status history&hellip;</p>
+    <p class="status-history-clues" id="status-history-clues" hidden></p>
+    <p class="status-history-last" id="status-history-last" hidden></p>
+    <p class="hint" id="status-history-empty" hidden>No status transitions recorded yet.</p>
+    <ul class="status-history" id="status-history-list" hidden></ul>
+    <p class="hint" id="status-history-truncated" hidden>
+      Older transitions were dropped by the per-app retention limit (50 most recent kept).
+    </p>
+  </div>
+</section>
+
 {% if links %}
 {% call section_head("Links", level=3) %}{% endcall %}
 <div class="table-scroll">
@@ -350,6 +364,7 @@ async function copyAppDiagnostics(btn) {
   "appDetailUrl": "/app_detail/{{ app.name }}",
   "appLogsStreamUrl": "/app_logs_stream/{{ app.app_id }}",
   "appStatusUrl": "/api/app_status/{{ app.app_id }}",
+  "appStatusHistoryUrl": "/api/app_status_history/{{ app.app_id }}",
   "appStatus": {{ app.status | tojson }},
   "nextUrl": {{ next_url | default("", true) | tojson }},
   "reloadAppUrl": "/reload_app/{{ app.app_id }}",

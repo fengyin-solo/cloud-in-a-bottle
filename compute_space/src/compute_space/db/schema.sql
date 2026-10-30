@@ -49,6 +49,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_port_mappings_host_port ON app_port_mappin
 CREATE INDEX IF NOT EXISTS idx_apps_status ON apps(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_apps_app_id ON apps(app_id);
 
+-- Bounded history of real app status transitions. The application appends one
+-- row only when apps.status actually changes (plus a single NULL -> 'building'
+-- birth row at install time) and prunes each app to the newest 50 rows; a gap
+-- in seq marks where older events were pruned. Nothing is seeded for apps that
+-- existed before this table, so their history starts empty by design.
+CREATE TABLE IF NOT EXISTS app_status_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    changed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    error_message TEXT,
+    source TEXT NOT NULL,
+    FOREIGN KEY (app_id) REFERENCES apps(app_id) ON DELETE CASCADE,
+    UNIQUE(app_id, seq),
+    CHECK (from_status IS NULL OR from_status IN ('building', 'starting', 'running', 'stopped', 'error', 'removing')),
+    CHECK (to_status IN ('building', 'starting', 'running', 'stopped', 'error', 'removing'))
+);
+CREATE INDEX IF NOT EXISTS idx_app_status_history_app_seq ON app_status_history(app_id, seq);
+
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE,
