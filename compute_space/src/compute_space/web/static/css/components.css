@@ -509,6 +509,95 @@ h2.section-title {
   color: var(--fg-status-warning);
 }
 
+/* ── Batch selection & results ───────────────────────────────────────── */
+
+/* Row checkboxes and the batch bar stay hidden until dashboard.js adds
+   js-batch to <body>, so a no-js dashboard renders exactly as before. */
+.app-row__select {
+  display: none;
+  flex: none;
+}
+
+body.js-batch .app-row__select {
+  display: block;
+}
+
+.batch-bar {
+  display: none;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--space-4);
+  margin-bottom: var(--space-2);
+  background: var(--bg-surface);
+  border: var(--border-w) solid var(--fg-border);
+  box-shadow: var(--shadow-card);
+  font-size: var(--text-body-sm);
+}
+
+body.js-batch .batch-bar {
+  display: flex;
+}
+
+.batch-bar__select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  white-space: nowrap;
+}
+
+.batch-bar__count {
+  color: var(--fg-secondary);
+}
+
+.batch-bar__spacer {
+  flex: 1 1 auto;
+}
+
+.batch-bar .btn {
+  font-size: var(--text-body-sm);
+}
+
+.batch-results {
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-2);
+  background: var(--bg-surface);
+  border: var(--border-w) solid var(--fg-border);
+  box-shadow: var(--shadow-card);
+  font-size: var(--text-body-sm);
+}
+
+.batch-results__summary {
+  margin: 0 0 var(--space-2);
+  font-weight: var(--weight-emphasized);
+}
+
+.batch-results ul {
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+
+.batch-results__item {
+  padding: 2px 0;
+}
+
+.batch-results__status--accepted {
+  color: var(--fg-status-positive);
+}
+
+.batch-results__status--skipped {
+  color: var(--fg-status-warning);
+}
+
+.batch-results__status--error {
+  color: var(--fg-status-negative);
+}
+
+.batch-results__dismiss {
+  font-size: var(--text-body-sm);
+}
+
 /* ── Search ─────────────────────────────────────────────────────────── */
 
 .search {

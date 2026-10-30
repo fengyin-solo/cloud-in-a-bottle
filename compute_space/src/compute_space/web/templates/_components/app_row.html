@@ -3,6 +3,10 @@
 {% macro app_row(app) -%}
 <div class="app-row" data-app-id="{{ app.app_id }}" data-status="{{ app.status }}"
      data-app-name="{{ app.name }}">
+  {#- Batch selection: hidden until dashboard.js enables batch mode, so a
+      no-js dashboard renders exactly as before. -#}
+  <input class="app-row__select" type="checkbox" value="{{ app.app_id }}"
+         aria-label="Select {{ app.name }}">
   <div class="app-row__main">
     <a class="app-row__name" href="{{ app_url(app.name) }}" target="_blank" rel="noopener">{{ app.name }}</a>
     {%- if app.manifest_name and app.manifest_name != app.name %}

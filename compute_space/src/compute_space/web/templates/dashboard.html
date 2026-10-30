@@ -38,6 +38,18 @@
   {% endcall %}
 
   {% if apps %}
+  {#- Owner batch controls: hidden/non-interactive until dashboard.js turns
+      batch mode on, so the page still works without JavaScript. -#}
+  <div class="batch-bar" id="batch-bar">
+    <label class="batch-bar__select-all">
+      <input type="checkbox" id="batch-select-all"> Select all
+    </label>
+    <span class="batch-bar__count" id="batch-count" aria-live="polite">0 selected</span>
+    <span class="batch-bar__spacer"></span>
+    <button class="btn" id="batch-stop" type="button" disabled>Stop selected</button>
+    <button class="btn" id="batch-reload" type="button" disabled>Reload selected</button>
+  </div>
+  <div class="batch-results" id="batch-results" hidden aria-live="polite"></div>
   <div class="app-list" id="app-list">
     {% for app in apps %}{{ app_row(app) }}{% endfor %}
   </div>
@@ -49,8 +61,10 @@
 
 <script id="page-config" type="application/json">
 {
-  "apiAppsUrl": {% if apps %}"/api/apps"{% else %}null{% endif %}
+  "apiAppsUrl": {% if apps %}"/api/apps"{% else %}null{% endif %},
+  "batchAppsUrl": {% if apps %}"/api/batch_app_action"{% else %}null{% endif %}
 }
 </script>
+<script src="{{ static_url('js/http-errors.js') }}"></script>
 <script src="{{ static_url('js/dashboard.js') }}"></script>
 {% endblock %}

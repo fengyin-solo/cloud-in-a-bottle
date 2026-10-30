@@ -236,6 +236,64 @@ class SetAppRemoteResponse:
     repo_url: str
 
 
+# Upper bound on how many apps one /api/batch_app_action request may name.
+# Keeps a single request from queuing an unbounded number of rebuilds at once
+# (each accepted reload spawns its own background build) and keeps the body a
+# sane size.
+MAX_BATCH_APPS = 20
+
+# The only lifecycle actions the batch endpoint performs. "reload" here is the
+# plain restart-from-disk action (POST /reload_app with no ``update``) — never
+# the git-pulling "Update & reload", whose OAuth/review flow has no place in a
+# fire-and-forget batch.
+BATCH_ACTIONS = ("stop", "reload")
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class BatchAppsRequest:
+    action: str
+    app_ids: list[str]
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class BatchAppResult:
+    """Independent outcome for one app in a batch.
+
+    ``result`` is one of:
+      * ``accepted`` — the same state transition the single-app route would
+        have performed has been claimed: a stop is committed, or a reload has
+        flipped the row to 'building' and spawned its background worker
+        (progress is observable via /api/app_status).
+      * ``skipped`` — the app exists but its current state/environment refuses
+        the action right now (being removed, already reloading, archive mount
+        down); nothing was changed for it.
+      * ``error`` — the entry itself could not be acted on (malformed id,
+        unknown app, unexpected failure). Other entries are unaffected.
+
+    ``code`` is a stable machine-readable reason (``invalid_id``,
+    ``not_found``, ``removing``, ``building``, ``starting``, ``unavailable``,
+    ``error``); ``reason`` carries the human-readable detail.
+    """
+
+    app_id: str
+    result: str
+    reason: str | None = None
+    code: str | None = None
+
+
+@attr.s(auto_attribs=True, frozen=True)
+class BatchAppsResponse:
+    # ``ok`` is True only when EVERY entry was accepted: a batch containing
+    # any skipped/errored app must never read as a wholesale success, while
+    # the accepted entries are never rolled back.
+    ok: bool
+    action: str
+    results: list[BatchAppResult]
+    accepted: int
+    skipped: int
+    errors: int
+
+
 # ─── helpers ───────────────────────────────────────────────────────────────
 
 
@@ -639,13 +697,15 @@ async def app_logs_stream(
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-@post(
-    "/stop_app/{app_id:str}",
-    status_code=200,
-    guards=[require_owner_auth],
-    raises=[ValidationException, NotFoundException, ConflictException],
-)
-async def stop_app(app_id: FromPath[str], db: NamedDependency[sqlite3.Connection]) -> Response[OkResponse]:
+def _stop_app_impl(app_id: str, db: sqlite3.Connection) -> None:
+    """Perform one app's stop transition.
+
+    Shared verbatim by POST ``/stop_app/<id>`` and the batch endpoint so both
+    enforce the same guards (a removing app is 409) and write the same final
+    state (``status='stopped'``, container cleared). Raises
+    ValidationException/NotFoundException/ConflictException for the route to
+    surface; the batch caller maps those onto a per-item result instead.
+    """
     app_row = _resolve_app(app_id, db)
     if _is_removing(app_row):
         raise ConflictException(detail="App is being removed")
@@ -657,6 +717,16 @@ async def stop_app(app_id: FromPath[str], db: NamedDependency[sqlite3.Connection
         (app_id,),
     )
     db.commit()
+
+
+@post(
+    "/stop_app/{app_id:str}",
+    status_code=200,
+    guards=[require_owner_auth],
+    raises=[ValidationException, NotFoundException, ConflictException],
+)
+async def stop_app(app_id: FromPath[str], db: NamedDependency[sqlite3.Connection]) -> Response[OkResponse]:
+    _stop_app_impl(app_id, db)
     return Response(content=OkResponse(ok=True), status_code=200, media_type=MediaType.JSON)
 
 
@@ -956,6 +1026,156 @@ async def reload_app_after_oauth(
         db=db,
         config=config,
         request=request,
+    )
+
+
+# ─── Batch stop/reload ─────────────────────────────────────────────────────
+
+
+def _batch_conflict_code(db: sqlite3.Connection, app_id: str) -> str:
+    """Stable code for a conflicted entry, taken from the app's live status.
+
+    Falls back to a generic ``conflict`` if the row is gone or settled by the
+    time we read it (e.g. the operation cleared between the guard and here).
+    """
+    row = db.execute("SELECT status FROM apps WHERE app_id = ?", (app_id,)).fetchone()
+    status = row["status"] if row else None
+    if status in ("removing", "building", "starting"):
+        return str(status)
+    return "conflict"
+
+
+async def _run_batch_item(
+    app_id: str,
+    action: str,
+    db: sqlite3.Connection,
+    config: Config,
+    request: Request[Any, Any, Any],
+) -> BatchAppResult:
+    """Process one batch entry through the single-app lifecycle logic.
+
+    The stop and reload paths are the exact helpers the single-app routes
+    call, so guards and state transitions can't drift. Their HTTP exceptions
+    are caught per entry and mapped to an item result: one bad app aborts
+    neither the rest of the batch nor anything already accepted.
+    """
+    if not is_valid_app_id(app_id):
+        return BatchAppResult(app_id=app_id, result="error", reason="Invalid app_id", code="invalid_id")
+    try:
+        if action == "stop":
+            _stop_app_impl(app_id, db)
+        else:
+            response = await _reload_app_impl(
+                app_id,
+                update=False,
+                continue_oauth=False,
+                approve_new_permissions=False,
+                db=db,
+                config=config,
+                request=request,
+            )
+            # _reload_app_impl returns the route-ready Response: 200 wrapping
+            # OkResponse on a claimed rebuild. A plain (non-update) reload can
+            # never return an OAuth Redirect or a review-required body, so
+            # anything else means the rebuild was not claimed and must not be
+            # reported as accepted.
+            if (
+                not isinstance(response, Response)
+                or isinstance(response, Redirect)
+                or response.status_code != 200
+                or not isinstance(getattr(response, "content", None), OkResponse)
+            ):
+                return BatchAppResult(
+                    app_id=app_id, result="error", reason="Reload was not accepted", code="not_accepted"
+                )
+    except NotFoundException as exc:
+        return BatchAppResult(app_id=app_id, result="error", reason=str(exc.detail), code="not_found")
+    except ConflictException as exc:
+        return BatchAppResult(
+            app_id=app_id, result="skipped", reason=str(exc.detail), code=_batch_conflict_code(db, app_id)
+        )
+    except ServiceUnavailableException as exc:
+        # Transient environment refusal (e.g. archive mount down) — the entry
+        # is retryable later, so it's skipped rather than a permanent error.
+        return BatchAppResult(app_id=app_id, result="skipped", reason=str(exc.detail), code="unavailable")
+    except ValidationException as exc:
+        # Malformed ids are rejected above before touching a route; keeping
+        # this catch means any future validation failure stays per-item.
+        return BatchAppResult(app_id=app_id, result="error", reason=str(exc.detail), code="invalid_id")
+    except Exception as exc:  # noqa: BLE001 — one app's surprise must not fail the whole batch
+        logger.exception("Batch {} failed for app {}", action, app_id)
+        return BatchAppResult(app_id=app_id, result="error", reason=str(exc) or "Internal error", code="error")
+    return BatchAppResult(app_id=app_id, result="accepted")
+
+
+@post(
+    "/api/batch_app_action",
+    status_code=200,
+    guards=[require_owner_auth],
+    raises=[ValidationException, NotAuthorizedException],
+)
+async def batch_app_action(
+    data: BatchAppsRequest,
+    db: NamedDependency[sqlite3.Connection],
+    config: NamedDependency[Config],
+    request: Request[Any, Any, Any],
+) -> Response[BatchAppsResponse]:
+    """Stop or reload several apps in one owner-authenticated request.
+
+    Entries are processed independently and sequentially, in request order
+    after de-duplicating repeated ``app_ids`` (an app named twice is acted on
+    once). Every entry comes back as ``accepted`` / ``skipped`` / ``error``
+    with its own reason; a partial failure neither rolls back nor blocks the
+    other apps, and the batch-level ``ok`` is True only when all entries were
+    accepted. A plain reload returns as soon as each rebuild is claimed — its
+    background progress is observed via the existing /api/app_status polling.
+
+    Request-body problems (unknown action, empty/over-long/non-string id
+    list) reject the whole request with 400 before any app is touched.
+    """
+    action = data.action
+    if not isinstance(action, str) or action not in BATCH_ACTIONS:
+        valid = ", ".join(repr(a) for a in BATCH_ACTIONS)
+        raise ValidationException(detail=f"Unknown action {action!r}; expected one of: {valid}")
+
+    raw_ids = data.app_ids
+    if not isinstance(raw_ids, list) or not all(isinstance(app_id, str) for app_id in raw_ids):
+        raise ValidationException(detail="app_ids must be a list of app id strings")
+    if not raw_ids:
+        raise ValidationException(detail="app_ids must not be empty")
+    if len(raw_ids) > MAX_BATCH_APPS:
+        raise ValidationException(
+            detail=f"Too many apps: a batch can contain at most {MAX_BATCH_APPS}, received {len(raw_ids)}"
+        )
+
+    # De-duplicate while preserving first-occurrence order, so results line up
+    # with the unique apps the caller named and no app is stopped/reloaded
+    # twice within the same request.
+    seen: set[str] = set()
+    app_ids: list[str] = []
+    for app_id in raw_ids:
+        if app_id not in seen:
+            seen.add(app_id)
+            app_ids.append(app_id)
+
+    results: list[BatchAppResult] = []
+    for app_id in app_ids:
+        results.append(await _run_batch_item(app_id, action, db, config, request))
+
+    accepted = sum(1 for r in results if r.result == "accepted")
+    skipped = sum(1 for r in results if r.result == "skipped")
+    errors = len(results) - accepted - skipped
+    return Response(
+        content=BatchAppsResponse(
+            ok=(skipped == 0 and errors == 0),
+            action=action,
+            results=results,
+            accepted=accepted,
+            skipped=skipped,
+            errors=errors,
+        ),
+        status_code=200,
+        media_type=MediaType.JSON,
     )
 
 
@@ -1270,6 +1490,7 @@ api_apps_routes = Router(
         stop_app,
         reload_app,
         reload_app_after_oauth,
+        batch_app_action,
         remove_app,
         rename_app,
         set_app_remote,
